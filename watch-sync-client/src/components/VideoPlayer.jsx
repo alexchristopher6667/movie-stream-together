@@ -22,9 +22,11 @@ import {
   X,
   Send,
   Subtitles,
-  UploadCloud
+  UploadCloud,
+  Gauge,
+  Tv
 } from 'lucide-react';
-import { formatTime, EMOJI_REACTIONS, SOCKET_SERVER_URL } from '../utils/helpers';
+import { formatTime, EMOJI_REACTIONS } from '../utils/helpers';
 
 export default function VideoPlayer({
   videoRef,
@@ -89,13 +91,33 @@ export default function VideoPlayer({
   unreadCount = 0,
   onResetUnread = () => {},
   onSendMessage = () => {},
-  onSendReaction = () => {}
+  onSendReaction = () => {},
+  engineRef
 }) {
   const [isFullscreenChatOpen, setIsFullscreenChatOpen] = useState(false);
   const [fullscreenChatInput, setFullscreenChatInput] = useState('');
 
   const ytPlayerRef = useRef(null);
   const ytIntervalRef = useRef(null);
+  const isInternalYT = useRef(false);
+  const isYtReady = useRef(false);
+  const isLocalDragging = useRef(false);
+
+  // YouTube Specific Captions State
+  const [ytCaptions, setYtCaptions] = useState([]);
+  const [currentYtCaption, setCurrentYtCaption] = useState('off');
+
+  const hasControlAccessRef = useRef(hasControlAccess);
+  hasControlAccessRef.current = hasControlAccess;
+
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+
+  const userVolumeRef = useRef(userVolume);
+  userVolumeRef.current = userVolume;
+
+  const isMutedRef = useRef(isMuted);
+  isMutedRef.current = isMuted;
 
   const isYouTube = Boolean(videoUrl && (videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')));
 
@@ -107,14 +129,58 @@ export default function VideoPlayer({
 
   const ytVideoId = isYouTube ? getYouTubeId(videoUrl) : null;
 
-  // Resolve media URL for local / demo video files
-  const resolvedMediaUrl = videoUrl && videoUrl.startsWith('/')
-    ? `${SOCKET_SERVER_URL}${videoUrl}`
-    : videoUrl;
+  // Unified engine controller exposed to Room.jsx
+  useEffect(() => {
+    if (!engineRef) return;
+    engineRef.current = {
+      isYouTube,
+      play: () => {
+        if (isYouTube && ytPlayerRef.current?.playVideo && isYtReady.current) {
+          isInternalYT.current = true;
+          ytPlayerRef.current.playVideo();
+          setTimeout(() => { isInternalYT.current = false; }, 400);
+        } else if (videoRef.current) {
+          videoRef.current.play().catch(() => {});
+        }
+      },
+      pause: () => {
+        if (isYouTube && ytPlayerRef.current?.pauseVideo && isYtReady.current) {
+          isInternalYT.current = true;
+          ytPlayerRef.current.pauseVideo();
+          setTimeout(() => { isInternalYT.current = false; }, 400);
+        } else if (videoRef.current) {
+          videoRef.current.pause();
+        }
+      },
+      seek: (time) => {
+        if (isYouTube && ytPlayerRef.current?.seekTo && isYtReady.current) {
+          isInternalYT.current = true;
+          ytPlayerRef.current.seekTo(time, true);
+          setTimeout(() => { isInternalYT.current = false; }, 600);
+        } else if (videoRef.current) {
+          videoRef.current.currentTime = time;
+        }
+      },
+      setSpeed: (speed) => {
+        if (isYouTube && ytPlayerRef.current?.setPlaybackRate && isYtReady.current) {
+          ytPlayerRef.current.setPlaybackRate(speed);
+        } else if (videoRef.current) {
+          videoRef.current.playbackRate = speed;
+        }
+      },
+      getCurrentTime: () => {
+        if (isYouTube && ytPlayerRef.current?.getCurrentTime && isYtReady.current) {
+          return ytPlayerRef.current.getCurrentTime() || 0;
+        }
+        return videoRef.current?.currentTime || 0;
+      }
+    };
+  }, [isYouTube, engineRef, videoRef]);
 
-  // 1. YouTube Player Controller
+  // YouTube Player Loader & Captions Discovery
   useEffect(() => {
     if (!isYouTube || !ytVideoId) {
+      isYtReady.current = false;
       if (ytIntervalRef.current) clearInterval(ytIntervalRef.current);
       if (ytPlayerRef.current) {
         try { ytPlayerRef.current.destroy(); } catch {}
@@ -125,7 +191,7 @@ export default function VideoPlayer({
 
     let isMounted = true;
 
-    const initYT = () => {
+    const setupPlayer = () => {
       if (!window.YT || !window.YT.Player) return;
       if (ytPlayerRef.current) {
         try { ytPlayerRef.current.destroy(); } catch {}
@@ -140,35 +206,67 @@ export default function VideoPlayer({
           fs: 0,
           modestbranding: 1,
           rel: 0,
-          playsinline: 1
+          playsinline: 1,
+          cc_load_policy: 1
         },
         events: {
           onReady: (event) => {
             if (!isMounted) return;
+            isYtReady.current = true;
             const dur = event.target.getDuration();
             if (dur) setDuration(dur);
+
+            // Fetch available closed captions
+            try {
+              const trackList = event.target.getOption?.('captions', 'tracklist') || [];
+              if (trackList.length > 0) setYtCaptions(trackList);
+            } catch {}
 
             if (currentTime > 0) {
               event.target.seekTo(currentTime, true);
             }
-            if (isPlaying) {
+            if (isPlayingRef.current) {
               event.target.playVideo();
             } else {
               event.target.pauseVideo();
             }
 
-            if (isMuted) event.target.mute();
+            if (isMutedRef.current) event.target.mute();
             else {
               event.target.unMute();
-              event.target.setVolume(userVolume * 100);
+              event.target.setVolume(userVolumeRef.current * 100);
             }
           },
           onStateChange: (event) => {
-            if (!isMounted) return;
-            if (event.data === 1 && !isPlaying) {
-              setIsPlaying(true);
-            } else if (event.data === 2 && isPlaying) {
-              setIsPlaying(false);
+            if (!isMounted || isInternalYT.current) return;
+
+            try {
+              const trackList = ytPlayerRef.current?.getOption?.('captions', 'tracklist') || [];
+              if (trackList.length > 0) setYtCaptions(trackList);
+            } catch {}
+
+            if (event.data === 1) {
+              if (!isPlayingRef.current) {
+                if (hasControlAccessRef.current) {
+                  const ct = ytPlayerRef.current?.getCurrentTime() || 0;
+                  socketRef.current?.emit('SYNC_ACTION', { actionType: 'PLAY', timestamp: ct });
+                } else {
+                  isInternalYT.current = true;
+                  ytPlayerRef.current?.pauseVideo();
+                  setTimeout(() => { isInternalYT.current = false; }, 300);
+                }
+              }
+            } else if (event.data === 2) {
+              if (isPlayingRef.current) {
+                if (hasControlAccessRef.current) {
+                  const ct = ytPlayerRef.current?.getCurrentTime() || 0;
+                  socketRef.current?.emit('SYNC_ACTION', { actionType: 'PAUSE', timestamp: ct });
+                } else {
+                  isInternalYT.current = true;
+                  ytPlayerRef.current?.playVideo();
+                  setTimeout(() => { isInternalYT.current = false; }, 300);
+                }
+              }
             } else if (event.data === 0) {
               handleVideoEnded();
             }
@@ -178,26 +276,33 @@ export default function VideoPlayer({
 
       if (ytIntervalRef.current) clearInterval(ytIntervalRef.current);
       ytIntervalRef.current = setInterval(() => {
-        if (ytPlayerRef.current && typeof ytPlayerRef.current.getCurrentTime === 'function') {
+        if (
+          ytPlayerRef.current &&
+          isYtReady.current &&
+          !isLocalDragging.current &&
+          !isInternalYT.current &&
+          typeof ytPlayerRef.current.getCurrentTime === 'function'
+        ) {
           const ct = ytPlayerRef.current.getCurrentTime() || 0;
           setCurrentTime(ct);
           const dur = ytPlayerRef.current.getDuration() || 0;
           if (dur > 0) setDuration(dur);
         }
-      }, 350);
+      }, 500);
     };
 
     if (!window.YT) {
       const tag = document.createElement('script');
       tag.src = 'https://www.youtube.com/iframe_api';
-      window.onYouTubeIframeAPIReady = initYT;
+      window.onYouTubeIframeAPIReady = setupPlayer;
       document.body.appendChild(tag);
     } else {
-      initYT();
+      setupPlayer();
     }
 
     return () => {
       isMounted = false;
+      isYtReady.current = false;
       if (ytIntervalRef.current) clearInterval(ytIntervalRef.current);
       if (ytPlayerRef.current) {
         try { ytPlayerRef.current.destroy(); } catch {}
@@ -206,18 +311,8 @@ export default function VideoPlayer({
     };
   }, [ytVideoId, isYouTube]);
 
-  // YouTube Play / Pause sync
   useEffect(() => {
-    if (!isYouTube || !ytPlayerRef.current || typeof ytPlayerRef.current.getPlayerState !== 'function') return;
-    try {
-      if (isPlaying) ytPlayerRef.current.playVideo();
-      else ytPlayerRef.current.pauseVideo();
-    } catch {}
-  }, [isPlaying, isYouTube]);
-
-  // YouTube Volume / Mute sync
-  useEffect(() => {
-    if (!isYouTube || !ytPlayerRef.current || typeof ytPlayerRef.current.setVolume !== 'function') return;
+    if (!isYouTube || !ytPlayerRef.current || !isYtReady.current || typeof ytPlayerRef.current.setVolume !== 'function') return;
     try {
       if (isMuted) {
         ytPlayerRef.current.mute();
@@ -228,67 +323,27 @@ export default function VideoPlayer({
     } catch {}
   }, [userVolume, isMuted, isYouTube]);
 
-  // 2. Native HTML5 Video loader (Demo video, Local files, Cloud mp4)
-  useEffect(() => {
-    const video = videoRef?.current;
-    if (isYouTube || !video || !resolvedMediaUrl) return;
-
-    if (video.src !== resolvedMediaUrl) {
-      video.src = resolvedMediaUrl;
-      video.load();
-    }
-
-    const onMeta = () => {
-      if (video.duration && !isNaN(video.duration)) {
-        setDuration(video.duration);
-      }
-      if (currentTime > 0) {
-        video.currentTime = currentTime;
-      }
-      if (isPlaying) {
-        video.play().catch(() => {});
-      }
-    };
-
-    const onTime = () => {
-      setCurrentTime(video.currentTime);
-    };
-
-    video.addEventListener('loadedmetadata', onMeta);
-    video.addEventListener('timeupdate', onTime);
-
-    return () => {
-      video.removeEventListener('loadedmetadata', onMeta);
-      video.removeEventListener('timeupdate', onTime);
-    };
-  }, [resolvedMediaUrl, isYouTube]);
-
-  // Native Video Play/Pause sync
-  useEffect(() => {
-    const video = videoRef?.current;
-    if (isYouTube || !video) return;
-
-    if (isPlaying && video.paused) {
-      video.play().catch(() => {});
-    } else if (!isPlaying && !video.paused) {
-      video.pause();
-    }
-  }, [isPlaying, isYouTube]);
-
-  // Native Video Volume/Mute sync
-  useEffect(() => {
-    const video = videoRef?.current;
-    if (isYouTube || !video) return;
-    video.volume = userVolume;
-    video.muted = isMuted;
-  }, [userVolume, isMuted, isYouTube]);
-
   const handleCustomSeek = (targetTime) => {
-    if (isYouTube && ytPlayerRef.current && typeof ytPlayerRef.current.seekTo === 'function') {
+    if (isYouTube && ytPlayerRef.current && isYtReady.current && typeof ytPlayerRef.current.seekTo === 'function') {
+      isInternalYT.current = true;
       ytPlayerRef.current.seekTo(targetTime, true);
+      setTimeout(() => { isInternalYT.current = false; }, 600);
     } else if (videoRef.current) {
       videoRef.current.currentTime = targetTime;
     }
+  };
+
+  const handleYtCaptionSelect = (track) => {
+    try {
+      if (track === 'off') {
+        ytPlayerRef.current?.setOption?.('captions', 'track', {});
+        setCurrentYtCaption('off');
+      } else {
+        ytPlayerRef.current?.setOption?.('captions', 'track', { languageCode: track.languageCode });
+        setCurrentYtCaption(track.languageName || track.displayName || track.languageCode);
+      }
+      setSettingsView(null);
+    } catch {}
   };
 
   const seekPercentage = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -755,56 +810,34 @@ export default function VideoPlayer({
         >
           {settingsView === 'main' && (
             <>
+              {/* Native Video: Audio Tracks Selector */}
               {!isYouTube && (
-                <>
-                  <button
-                    onClick={() => setSettingsView('audio')}
-                    style={{
-                      background: 'transparent',
-                      border: 'none',
-                      borderRadius: 8,
-                      padding: '8px 10px',
-                      color: '#f8fafc',
-                      fontSize: 12,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    <span>Audio Tracks</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#94a3b8' }}>
-                      <span style={{ fontSize: 11, color: '#38bdf8' }}>{currentAudioLabel}</span>
-                      <ChevronRight size={14} />
-                    </div>
-                  </button>
-
-                  <button
-                    onClick={() => setSettingsView('subtitles')}
-                    style={{
-                      background: 'transparent',
-                      border: 'none',
-                      borderRadius: 8,
-                      padding: '8px 10px',
-                      color: '#f8fafc',
-                      fontSize: 12,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    <span>Subtitles / CC</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#94a3b8' }}>
-                      <span style={{ fontSize: 11, color: '#38bdf8' }}>{currentSubLabel}</span>
-                      <ChevronRight size={14} />
-                    </div>
-                  </button>
-                </>
+                <button
+                  onClick={() => setSettingsView('audio')}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    borderRadius: 8,
+                    padding: '8px 10px',
+                    color: '#f8fafc',
+                    fontSize: 12,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <span>Audio Tracks</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#94a3b8' }}>
+                    <span style={{ fontSize: 11, color: '#38bdf8' }}>{currentAudioLabel}</span>
+                    <ChevronRight size={14} />
+                  </div>
+                </button>
               )}
 
+              {/* Subtitles / CC Option */}
               <button
-                onClick={() => setSettingsView('speed')}
+                onClick={() => setSettingsView('subtitles')}
                 style={{
                   background: 'transparent',
                   border: 'none',
@@ -818,17 +851,73 @@ export default function VideoPlayer({
                   cursor: 'pointer'
                 }}
               >
-                <span>Playback Speed</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Subtitles size={14} color="#94a3b8" />
+                  <span>Subtitles / CC</span>
+                </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#94a3b8' }}>
-                  <span style={{ fontSize: 11, color: '#38bdf8' }}>{playbackSpeed}x</span>
+                  <span style={{ fontSize: 11, color: '#38bdf8' }}>
+                    {isYouTube ? currentYtCaption : currentSubLabel}
+                  </span>
                   <ChevronRight size={14} />
                 </div>
               </button>
+
+              {/* Playback Speed Option */}
+              {hasControlAccess ? (
+                <button
+                  onClick={() => setSettingsView('speed')}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    borderRadius: 8,
+                    padding: '8px 10px',
+                    color: '#f8fafc',
+                    fontSize: 12,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Gauge size={14} color="#94a3b8" />
+                    <span>Playback Speed</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#94a3b8' }}>
+                    <span style={{ fontSize: 11, color: '#38bdf8' }}>{playbackSpeed}x</span>
+                    <ChevronRight size={14} />
+                  </div>
+                </button>
+              ) : (
+                <div style={{ padding: '8px 10px', color: '#64748b', fontSize: 11, display: 'flex', justifyContent: 'space-between' }}>
+                  <span>Playback Speed</span>
+                  <span>{playbackSpeed}x (Host Only)</span>
+                </div>
+              )}
+
+              {/* Informational YouTube Stream Badge */}
+              {isYouTube && (
+                <div style={{ 
+                  margin: '4px 2px 2px 2px', 
+                  padding: '6px 8px', 
+                  background: 'rgba(255, 255, 255, 0.04)', 
+                  borderRadius: 8, 
+                  fontSize: 11, 
+                  color: '#94a3b8',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6
+                }}>
+                  <Tv size={12} color="#38bdf8" />
+                  <span>Quality: Auto (Adaptive HD)</span>
+                </div>
+              )}
             </>
           )}
 
-          {/* Subtitles Menu */}
-          {settingsView === 'subtitles' && !isYouTube && (
+          {/* Subtitles Submenu */}
+          {settingsView === 'subtitles' && (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 6px', marginBottom: 4, borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
                 <button onClick={() => setSettingsView('main')} style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', display: 'flex' }}>
@@ -837,13 +926,16 @@ export default function VideoPlayer({
                 <span style={{ fontSize: 12, fontWeight: 600, color: '#f8fafc' }}>Subtitles</span>
               </div>
               <button
-                onClick={() => handleSubtitleChange('off')}
+                onClick={() => {
+                  if (isYouTube) handleYtCaptionSelect('off');
+                  else handleSubtitleChange('off');
+                }}
                 style={{
-                  background: selectedSubtitleId === 'off' ? 'rgba(56, 189, 248, 0.15)' : 'transparent',
+                  background: (isYouTube ? currentYtCaption === 'off' : selectedSubtitleId === 'off') ? 'rgba(56, 189, 248, 0.15)' : 'transparent',
                   border: 'none',
                   borderRadius: 8,
                   padding: '7px 10px',
-                  color: selectedSubtitleId === 'off' ? '#38bdf8' : '#f8fafc',
+                  color: (isYouTube ? currentYtCaption === 'off' : selectedSubtitleId === 'off') ? '#38bdf8' : '#f8fafc',
                   fontSize: 12,
                   display: 'flex',
                   justifyContent: 'space-between',
@@ -852,51 +944,82 @@ export default function VideoPlayer({
                 }}
               >
                 <span>Off</span>
-                {selectedSubtitleId === 'off' && <Check size={14} />}
+                {(isYouTube ? currentYtCaption === 'off' : selectedSubtitleId === 'off') && <Check size={14} />}
               </button>
-              {availableSubtitles.map((sub) => (
-                <button
-                  key={sub.id}
-                  onClick={() => handleSubtitleChange(sub)}
-                  style={{
-                    background: selectedSubtitleId === sub.id ? 'rgba(56, 189, 248, 0.15)' : 'transparent',
-                    border: 'none',
-                    borderRadius: 8,
-                    padding: '7px 10px',
-                    color: selectedSubtitleId === sub.id ? '#38bdf8' : '#f8fafc',
-                    fontSize: 12,
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    cursor: 'pointer'
-                  }}
-                >
-                  <span>{sub.label}</span>
-                  {selectedSubtitleId === sub.id && <Check size={14} />}
-                </button>
-              ))}
-              <label
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  padding: '7px 10px',
-                  borderRadius: 8,
-                  fontSize: 12,
-                  color: '#38bdf8',
-                  background: 'rgba(56, 189, 248, 0.1)',
-                  cursor: 'pointer',
-                  marginTop: 4
-                }}
-              >
-                <UploadCloud size={14} />
-                <span>Upload Custom .SRT/.VTT</span>
-                <input type="file" accept=".srt,.vtt" onChange={handleCustomSubtitleFile} style={{ display: 'none' }} />
-              </label>
+
+              {isYouTube ? (
+                ytCaptions.map((c, idx) => {
+                  const label = c.displayName || c.languageName || c.languageCode;
+                  const isSelected = currentYtCaption === label;
+                  return (
+                    <button
+                      key={c.languageCode || idx}
+                      onClick={() => handleYtCaptionSelect(c)}
+                      style={{
+                        background: isSelected ? 'rgba(56, 189, 248, 0.15)' : 'transparent',
+                        border: 'none',
+                        borderRadius: 8,
+                        padding: '7px 10px',
+                        color: isSelected ? '#38bdf8' : '#f8fafc',
+                        fontSize: 12,
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      <span>{label}</span>
+                      {isSelected && <Check size={14} />}
+                    </button>
+                  );
+                })
+              ) : (
+                <>
+                  {availableSubtitles.map((sub) => (
+                    <button
+                      key={sub.id}
+                      onClick={() => handleSubtitleChange(sub)}
+                      style={{
+                        background: selectedSubtitleId === sub.id ? 'rgba(56, 189, 248, 0.15)' : 'transparent',
+                        border: 'none',
+                        borderRadius: 8,
+                        padding: '7px 10px',
+                        color: selectedSubtitleId === sub.id ? '#38bdf8' : '#f8fafc',
+                        fontSize: 12,
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      <span>{sub.label}</span>
+                      {selectedSubtitleId === sub.id && <Check size={14} />}
+                    </button>
+                  ))}
+                  <label
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      padding: '7px 10px',
+                      borderRadius: 8,
+                      fontSize: 12,
+                      color: '#38bdf8',
+                      background: 'rgba(56, 189, 248, 0.1)',
+                      cursor: 'pointer',
+                      marginTop: 4
+                    }}
+                  >
+                    <UploadCloud size={14} />
+                    <span>Upload Custom .SRT/.VTT</span>
+                    <input type="file" accept=".srt,.vtt" onChange={handleCustomSubtitleFile} style={{ display: 'none' }} />
+                  </label>
+                </>
+              )}
             </>
           )}
 
-          {/* Audio Tracks Menu */}
+          {/* Audio Tracks Submenu */}
           {settingsView === 'audio' && !isYouTube && (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 6px', marginBottom: 4, borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
@@ -933,7 +1056,7 @@ export default function VideoPlayer({
             </>
           )}
 
-          {/* Speed Menu */}
+          {/* Speed Submenu */}
           {settingsView === 'speed' && (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 6px', marginBottom: 4, borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
@@ -947,11 +1070,10 @@ export default function VideoPlayer({
                   key={sp}
                   onClick={() => {
                     setPlaybackSpeed(sp);
-                    if (isYouTube && ytPlayerRef.current && typeof ytPlayerRef.current.setPlaybackRate === 'function') {
-                      ytPlayerRef.current.setPlaybackRate(sp);
-                    } else if (videoRef.current) {
-                      videoRef.current.playbackRate = sp;
+                    if (engineRef?.current?.setSpeed) {
+                      engineRef.current.setSpeed(sp);
                     }
+                    socketRef.current?.emit('SYNC_ACTION', { actionType: 'SPEED', speed: sp });
                     setSettingsView(null);
                   }}
                   style={{
@@ -994,7 +1116,7 @@ export default function VideoPlayer({
           zIndex: 30
         }}
       >
-        {/* Range Bar */}
+        {/* Scrub Bar */}
         <div style={{ position: 'relative', width: '100%', height: 14, display: 'flex', alignItems: 'center' }}>
           <div style={{ position: 'absolute', width: '100%', height: 4, borderRadius: 9999, background: 'rgba(255, 255, 255, 0.2)', overflow: 'hidden' }}>
             <div style={{ width: `${seekPercentage}%`, height: '100%', background: 'linear-gradient(90deg, #38bdf8, #818cf8)' }} />
@@ -1006,14 +1128,25 @@ export default function VideoPlayer({
             step="0.1"
             value={currentTime}
             disabled={!hasControlAccess}
-            onMouseDown={handleSeekStart}
-            onTouchStart={handleSeekStart}
-            onChange={(e) => {
-              handleSeekChange(e);
+            onMouseDown={() => {
+              isLocalDragging.current = true;
+              handleSeekStart();
+            }}
+            onTouchStart={() => {
+              isLocalDragging.current = true;
+              handleSeekStart();
+            }}
+            onChange={handleSeekChange}
+            onMouseUp={(e) => {
+              isLocalDragging.current = false;
+              handleSeekEnd(e);
               handleCustomSeek(parseFloat(e.target.value));
             }}
-            onMouseUp={handleSeekEnd}
-            onTouchEnd={handleSeekEnd}
+            onTouchEnd={(e) => {
+              isLocalDragging.current = false;
+              handleSeekEnd(e);
+              handleCustomSeek(parseFloat(e.target.value));
+            }}
             style={{ position: 'absolute', width: '100%', height: '100%', opacity: 0, cursor: hasControlAccess ? 'pointer' : 'not-allowed' }}
           />
         </div>
@@ -1035,20 +1168,21 @@ export default function VideoPlayer({
 
           {/* Center: Play / Pause / Skip */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, flexShrink: 0 }}>
-            <button onClick={() => skipSeconds(-10)} title="Rewind 10s" style={{ background: 'transparent', border: 'none', color: '#cbd5e1', cursor: 'pointer', padding: 4, display: 'flex' }}>
+            <button onClick={() => skipSeconds(-10)} disabled={!hasControlAccess} title="Rewind 10s" style={{ background: 'transparent', border: 'none', color: hasControlAccess ? '#cbd5e1' : '#475569', cursor: hasControlAccess ? 'pointer' : 'not-allowed', padding: 4, display: 'flex' }}>
               <RotateCcw size={18} />
             </button>
             <button
               onClick={togglePlay}
+              disabled={!hasControlAccess}
               title={isPlaying ? 'Pause' : 'Play'}
               style={{
                 width: 38,
                 height: 38,
                 borderRadius: '50%',
-                background: 'rgba(255, 255, 255, 0.12)',
+                background: hasControlAccess ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.04)',
                 border: '1px solid rgba(255, 255, 255, 0.25)',
-                color: '#fff',
-                cursor: 'pointer',
+                color: hasControlAccess ? '#fff' : '#64748b',
+                cursor: hasControlAccess ? 'pointer' : 'not-allowed',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center'
@@ -1056,10 +1190,10 @@ export default function VideoPlayer({
             >
               {isPlaying ? <Pause size={18} /> : <Play size={18} style={{ marginLeft: 2 }} />}
             </button>
-            <button onClick={() => skipSeconds(10)} title="Forward 10s" style={{ background: 'transparent', border: 'none', color: '#cbd5e1', cursor: 'pointer', padding: 4, display: 'flex' }}>
+            <button onClick={() => skipSeconds(10)} disabled={!hasControlAccess} title="Forward 10s" style={{ background: 'transparent', border: 'none', color: hasControlAccess ? '#cbd5e1' : '#475569', cursor: hasControlAccess ? 'pointer' : 'not-allowed', padding: 4, display: 'flex' }}>
               <RotateCw size={18} />
             </button>
-            <button onClick={playNextVideo} disabled={currentQueueIndex >= queue.length - 1} title="Next" style={{ background: 'transparent', border: 'none', color: currentQueueIndex >= queue.length - 1 ? '#475569' : '#cbd5e1', cursor: currentQueueIndex >= queue.length - 1 ? 'not-allowed' : 'pointer', padding: 4, display: 'flex' }}>
+            <button onClick={playNextVideo} disabled={!hasControlAccess || currentQueueIndex >= queue.length - 1} title="Next" style={{ background: 'transparent', border: 'none', color: !hasControlAccess || currentQueueIndex >= queue.length - 1 ? '#475569' : '#cbd5e1', cursor: !hasControlAccess || currentQueueIndex >= queue.length - 1 ? 'not-allowed' : 'pointer', padding: 4, display: 'flex' }}>
               <SkipForward size={18} />
             </button>
           </div>
@@ -1067,16 +1201,47 @@ export default function VideoPlayer({
           {/* Right: Subtitles, Settings, PiP, Fullscreen */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, flex: 1, minWidth: 0 }}>
             {!isYouTube && (
-              <button onClick={() => setSettingsView(settingsView === 'subtitles' ? null : 'subtitles')} title="Subtitles" style={{ background: selectedSubtitleId !== 'off' ? 'rgba(56, 189, 248, 0.2)' : 'transparent', border: 'none', color: selectedSubtitleId !== 'off' ? '#38bdf8' : '#cbd5e1', cursor: 'pointer', padding: 4, borderRadius: 6, display: 'flex' }}>
+              <button
+                onClick={() => setSettingsView(settingsView === 'subtitles' ? null : 'subtitles')}
+                title="Subtitles"
+                style={{
+                  background: selectedSubtitleId !== 'off' ? 'rgba(56, 189, 248, 0.2)' : 'transparent',
+                  border: 'none',
+                  color: selectedSubtitleId !== 'off' ? '#38bdf8' : '#cbd5e1',
+                  cursor: 'pointer',
+                  padding: 4,
+                  borderRadius: 6,
+                  display: 'flex'
+                }}
+              >
                 <Subtitles size={18} />
               </button>
             )}
-            <button onClick={togglePiP} title="Picture-in-Picture" style={{ background: 'transparent', border: 'none', color: '#cbd5e1', cursor: 'pointer', padding: 4, display: 'flex' }}>
-              <PictureInPicture2 size={18} />
-            </button>
-            <button onClick={() => setSettingsView(settingsView ? null : 'main')} title="Playback Settings" style={{ background: settingsView ? 'rgba(56, 189, 248, 0.2)' : 'transparent', border: 'none', color: settingsView ? '#38bdf8' : '#cbd5e1', cursor: 'pointer', padding: 4, borderRadius: 6, display: 'flex' }}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setSettingsView(settingsView ? null : 'main');
+              }}
+              title="Playback Settings"
+              style={{
+                background: settingsView ? 'rgba(56, 189, 248, 0.25)' : 'transparent',
+                border: 'none',
+                color: settingsView ? '#38bdf8' : '#cbd5e1',
+                cursor: 'pointer',
+                padding: 4,
+                borderRadius: 6,
+                display: 'flex'
+              }}
+            >
               <Settings size={18} />
             </button>
+
+            {!isYouTube && (
+              <button onClick={togglePiP} title="Picture-in-Picture" style={{ background: 'transparent', border: 'none', color: '#cbd5e1', cursor: 'pointer', padding: 4, display: 'flex' }}>
+                <PictureInPicture2 size={18} />
+              </button>
+            )}
+
             <button onClick={toggleFullscreen} title="Toggle Fullscreen" style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', padding: 4, display: 'flex' }}>
               {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
             </button>

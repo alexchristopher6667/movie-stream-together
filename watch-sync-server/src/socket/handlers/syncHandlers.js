@@ -1,13 +1,15 @@
 import { roomStore } from '../../models/RoomStore.js';
 
 export const registerSyncHandlers = (io, socket) => {
-  // Sync Play / Pause / Seek actions
-  socket.on('SYNC_ACTION', ({ actionType, timestamp }) => {
+  // Sync Play / Pause / Seek / Speed actions
+  socket.on('SYNC_ACTION', ({ actionType, timestamp, speed }) => {
     const room = roomStore.get(socket.data.roomId);
     if (!room || !room.hasPermission(socket.id)) return;
 
-    room.lastTimestamp = Math.max(0, timestamp);
-    room.updatedAt = Date.now();
+    if (timestamp !== undefined) {
+      room.lastTimestamp = Math.max(0, timestamp);
+      room.updatedAt = Date.now();
+    }
 
     // Immediate state synchronization on the server
     if (actionType === 'PLAY') {
@@ -21,6 +23,7 @@ export const registerSyncHandlers = (io, socket) => {
     socket.to(room.id).emit('SYNC_BROADCAST', {
       actionType,
       timestamp: room.lastTimestamp,
+      speed: speed || 1,
       triggeredBy: socket.data.username
     });
   });

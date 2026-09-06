@@ -1,7 +1,8 @@
 export const SOCKET_SERVER_URL =
-  window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  import.meta.env.VITE_SERVER_URL ||
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
     ? 'http://localhost:4000'
-    : window.location.origin;
+    : window.location.origin);
 
 export const DEFAULT_VIDEO =
   'https://cdn.jsdelivr.net/npm/video-media-samples@1.0.0/big-buck-bunny-480p-30sec.mp4';

@@ -1,158 +1,196 @@
 import { roomStore } from '../../models/RoomStore.js';
 import { Room } from '../../models/Room.js';
 
-// Safe getter & setter helper across different RoomStore implementations
-const getRoom = (id) => {
-  if (!id) return null;
-  if (typeof roomStore.get === 'function') return roomStore.get(id);
-  if (roomStore.rooms instanceof Map) return roomStore.rooms.get(id);
-  return roomStore[id] || null;
-};
-
-const saveRoom = (id, roomInstance) => {
-  if (typeof roomStore.set === 'function') {
-    roomStore.set(id, roomInstance);
-  } else if (roomStore.rooms instanceof Map) {
-    roomStore.rooms.set(id, roomInstance);
-  } else {
-    roomStore[id] = roomInstance;
-  }
-};
-
-const deleteRoom = (id) => {
-  if (typeof roomStore.delete === 'function') {
-    roomStore.delete(id);
-  } else if (roomStore.rooms instanceof Map) {
-    roomStore.rooms.delete(id);
-  } else {
-    delete roomStore[id];
-  }
-};
-
 export const registerRoomHandlers = (io, socket) => {
   socket.on('REQUEST_JOIN_ROOM', ({ roomId: rawRoomId, username, peerId, hostToken, defaultVideoUrl }) => {
     const roomId = String(rawRoomId || '').trim().toLowerCase();
     if (!roomId) return;
 
     socket.data.roomId = roomId;
-    socket.data.username = username;
+    socket.data.username = username || `User-${socket.id.substring(0, 4)}`;
     socket.data.peerId = peerId;
 
-    let room = getRoom(roomId);
+    let room = roomStore.get(roomId);
 
-    // Create room if it doesn't exist
+    // If room doesn't exist, this user is creating it as the Host
     if (!room) {
-      if (typeof roomStore.createRoom === 'function') {
-        room = roomStore.createRoom(roomId, socket.id, username, hostToken, defaultVideoUrl);
-      } else if (typeof roomStore.create === 'function') {
-        room = roomStore.create(roomId, socket.id, username, hostToken, defaultVideoUrl);
-      } else {
-        room = new Room(roomId, socket.id, username, hostToken, defaultVideoUrl);
-        saveRoom(roomId, room);
-      }
+      room = new Room(roomId, socket.id, socket.data.username, defaultVideoUrl, hostToken);
+      roomStore.set(roomId, room);
     }
 
-    // Join the socket.io room channel
-    socket.join(roomId);
-
-    const isRoomHost = room.hostToken === hostToken || room.hostSocketId === socket.id;
+    const isRoomHost = (hostToken && room.hostToken === hostToken) || room.hostSocketId === socket.id;
 
     if (isRoomHost) {
       room.hostSocketId = socket.id;
-      if (typeof room.addUser === 'function') {
-        room.addUser({ socketId: socket.id, username, peerId, isHost: true, canControl: true });
+      room.allowedControllers.add(socket.id);
+      if (defaultVideoUrl && (!room.videoUrl || room.videoUrl.includes('hls-demo'))) {
+        room.videoUrl = defaultVideoUrl;
+        if (room.queue.length > 0) room.queue[0].url = defaultVideoUrl;
       }
-      if (room.allowedControllers?.add) {
-        room.allowedControllers.add(socket.id);
-      }
-      if (!room.videoUrl) {
-        room.videoUrl = defaultVideoUrl || '/default-video.mp4';
-      }
-    } else {
-      if (typeof room.addUser === 'function') {
-        room.addUser({
-          socketId: socket.id,
-          username,
-          peerId,
-          isHost: false,
-          canControl: Boolean(room.allowedControllers?.has?.(socket.id))
-        });
-      }
+
+      room.admit(socket, peerId);
+
+      const currentUsers = Array.from(room.users.entries()).map(([id, u]) => ({
+        socketId: id,
+        username: u.username,
+        peerId: u.peerId
+      }));
+
+      socket.emit('ROOM_ADMITTED', {
+        roomId: room.id,
+        isHost: true,
+        hostSocketId: room.hostSocketId,
+        allowedControllers: Array.from(room.allowedControllers),
+        users: currentUsers,
+        videoUrl: room.videoUrl,
+        mediaMeta: room.mediaMeta,
+        currentTimestamp: room.lastTimestamp || 0,
+        isPlaying: Boolean(room.isPlaying),
+        queue: room.queue || [],
+        currentQueueIndex: room.currentQueueIndex || 0,
+        bookmarks: room.bookmarks || []
+      });
+
+      io.to(roomId).emit('USER_JOINED', {
+        socketId: socket.id,
+        username: socket.data.username,
+        peerId,
+        users: currentUsers
+      });
+      return;
     }
 
-    const currentUsers = typeof room.getUsersList === 'function'
-      ? room.getUsersList()
-      : Array.from(room.users?.values ? room.users.values() : []);
+    // NON-HOST: Put in lobby and notify Host
+    room.pendingLobby.set(socket.id, { socket, username: socket.data.username, peerId });
+    socket.emit('LOBBY_WAITING');
 
-    // 1. Admit user with existing room state
-    socket.emit('ROOM_ADMITTED', {
-      roomId: room.id,
-      isHost: isRoomHost,
-      hostSocketId: room.hostSocketId,
-      allowedControllers: room.allowedControllers ? Array.from(room.allowedControllers) : [room.hostSocketId],
-      users: currentUsers,
-      videoUrl: room.videoUrl,
-      mediaMeta: room.mediaMeta,
-      currentTimestamp: room.lastTimestamp || 0,
-      isPlaying: Boolean(room.isPlaying),
-      queue: room.queue || [],
-      currentQueueIndex: room.currentQueueIndex || 0,
-      bookmarks: room.bookmarks || []
+    if (room.hostSocketId) {
+      io.to(room.hostSocketId).emit('INCOMING_KNOCK', {
+        socketId: socket.id,
+        username: socket.data.username
+      });
+    }
+  });
+
+  // Host clicks "Admit"
+  socket.on('ADMIT_USER', ({ targetSocketId }) => {
+    const room = roomStore.get(socket.data.roomId);
+    if (!room || room.hostSocketId !== socket.id) return;
+
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (targetSocket) {
+      room.admit(targetSocket, targetSocket.data.peerId);
+
+      const currentUsers = Array.from(room.users.entries()).map(([id, u]) => ({
+        socketId: id,
+        username: u.username,
+        peerId: u.peerId
+      }));
+
+      // Admit guest with synced position and play state
+      let currentPos = room.lastTimestamp;
+      if (room.isPlaying) {
+        currentPos += (Date.now() - room.updatedAt) / 1000;
+      }
+
+      targetSocket.emit('ROOM_ADMITTED', {
+        roomId: room.id,
+        isHost: false,
+        hostSocketId: room.hostSocketId,
+        allowedControllers: Array.from(room.allowedControllers),
+        users: currentUsers,
+        videoUrl: room.videoUrl,
+        mediaMeta: room.mediaMeta,
+        currentTimestamp: currentPos,
+        isPlaying: Boolean(room.isPlaying),
+        queue: room.queue || [],
+        currentQueueIndex: room.currentQueueIndex || 0,
+        bookmarks: room.bookmarks || []
+      });
+
+      io.to(room.id).emit('USER_JOINED', {
+        socketId: targetSocket.id,
+        username: targetSocket.data.username,
+        peerId: targetSocket.data.peerId,
+        users: currentUsers
+      });
+
+      io.to(room.hostSocketId).emit('KNOCK_RESOLVED', { targetSocketId });
+    }
+  });
+
+  // Host clicks "Decline"
+  socket.on('DECLINE_USER', ({ targetSocketId }) => {
+    const room = roomStore.get(socket.data.roomId);
+    if (!room || room.hostSocketId !== socket.id) return;
+    room.pendingLobby.delete(targetSocketId);
+    io.to(targetSocketId).emit('LOBBY_DECLINED');
+    io.to(room.hostSocketId).emit('KNOCK_RESOLVED', { targetSocketId });
+  });
+
+  socket.on('TOGGLE_USER_CONTROL', ({ targetSocketId }) => {
+    const room = roomStore.get(socket.data.roomId);
+    if (!room || room.hostSocketId !== socket.id) return;
+    if (room.allowedControllers.has(targetSocketId)) {
+      room.allowedControllers.delete(targetSocketId);
+    } else {
+      room.allowedControllers.add(targetSocketId);
+    }
+    io.to(room.id).emit('CONTROLLER_PERMISSIONS_UPDATED', {
+      allowedControllers: Array.from(room.allowedControllers)
     });
+  });
 
-    // 2. Broadcast updated user list to everyone in this room
-    io.to(roomId).emit('USER_JOINED', {
-      socketId: socket.id,
-      username,
-      peerId,
+  socket.on('TRANSFER_HOST', ({ targetSocketId }) => {
+    const room = roomStore.get(socket.data.roomId);
+    if (!room || room.hostSocketId !== socket.id) return;
+    const targetUser = room.users.get(targetSocketId);
+    if (targetUser) {
+      room.hostSocketId = targetSocketId;
+      room.allowedControllers.add(targetSocketId);
+      io.to(room.id).emit('HOST_CHANGED', {
+        newHostSocketId: targetSocketId,
+        newHostUsername: targetUser.username,
+        allowedControllers: Array.from(room.allowedControllers)
+      });
+    }
+  });
+
+  socket.on('KICK_USER', ({ targetSocketId }) => {
+    const room = roomStore.get(socket.data.roomId);
+    if (!room || room.hostSocketId !== socket.id) return;
+    io.to(targetSocketId).emit('KICKED_FROM_ROOM', { hostUsername: socket.data.username });
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (targetSocket) targetSocket.leave(room.id);
+    room.remove(targetSocketId);
+    const currentUsers = Array.from(room.users.entries()).map(([id, u]) => ({
+      socketId: id,
+      username: u.username,
+      peerId: u.peerId
+    }));
+    io.to(room.id).emit('USER_LEFT', {
+      socketId: targetSocketId,
+      username: targetSocket?.data?.username || 'User',
       users: currentUsers
     });
   });
 
-  socket.on('disconnect', () => {
-    const roomId = socket.data.roomId;
-    if (!roomId) return;
-
-    const room = getRoom(roomId);
+  socket.on('CREATE_BOOKMARK', ({ timestamp, label }) => {
+    const room = roomStore.get(socket.data.roomId);
     if (!room) return;
+    const bookmark = {
+      id: `bm-${Date.now()}`,
+      timestamp,
+      label: label || `Scene @ ${Math.floor(timestamp)}s`
+    };
+    room.bookmarks.push(bookmark);
+    io.to(room.id).emit('BOOKMARKS_UPDATED', { bookmarks: room.bookmarks });
+  });
 
-    if (typeof room.removeUser === 'function') {
-      room.removeUser(socket.id);
-    }
-    if (room.allowedControllers?.delete) {
-      room.allowedControllers.delete(socket.id);
-    }
-
-    if (room.hostSocketId === socket.id && room.users && (room.users.size > 0 || Object.keys(room.users).length > 0)) {
-      const remainingList = Array.from(room.users.values ? room.users.values() : []);
-      if (remainingList.length > 0) {
-        const nextUser = remainingList[0];
-        room.hostSocketId = nextUser.socketId;
-        nextUser.isHost = true;
-        if (room.allowedControllers?.add) {
-          room.allowedControllers.add(nextUser.socketId);
-        }
-
-        io.to(roomId).emit('HOST_CHANGED', {
-          newHostSocketId: nextUser.socketId,
-          newHostUsername: nextUser.username
-        });
-      }
-    }
-
-    const currentUsers = typeof room.getUsersList === 'function'
-      ? room.getUsersList()
-      : Array.from(room.users?.values ? room.users.values() : []);
-
-    io.to(roomId).emit('USER_LEFT', {
-      socketId: socket.id,
-      username: socket.data.username,
-      peerId: socket.data.peerId,
-      users: currentUsers
-    });
-
-    if (currentUsers.length === 0) {
-      deleteRoom(roomId);
-    }
+  socket.on('DELETE_BOOKMARK', ({ bookmarkId }) => {
+    const room = roomStore.get(socket.data.roomId);
+    if (!room) return;
+    room.bookmarks = room.bookmarks.filter((b) => b.id !== bookmarkId);
+    io.to(room.id).emit('BOOKMARKS_UPDATED', { bookmarks: room.bookmarks });
   });
 };

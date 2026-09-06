@@ -14,7 +14,7 @@ export const CONFIG = {
   PORT: process.env.PORT || 4000,
   UPLOADS_DIR: path.join(__dirname, '../../uploads'),
   MEDIA_DIR: path.join(__dirname, '../../media'),
-  DEFAULT_VIDEO: '/media/hls-demo/index.m3u8',
+  DEFAULT_VIDEO: 'https://cdn.jsdelivr.net/npm/video-media-samples@1.0.0/big-buck-bunny-480p-30sec.mp4',
   HEARTBEAT_INTERVAL_MS: 1500,
   CORS_ORIGIN: '*'
 };
