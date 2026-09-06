@@ -57,6 +57,15 @@ app.use('/media', express.static(CONFIG.MEDIA_DIR, {
 const httpServer = createServer(app);
 const io = initSocketManager(httpServer);
 
+// Lightweight healthcheck endpoint for keep-alive pings
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Register API Routes
 app.use('/api', createMediaRoutes(io));
 
