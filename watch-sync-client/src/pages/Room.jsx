@@ -5,7 +5,7 @@ import Hls from 'hls.js';
 import Peer from 'peerjs';
 import { socketService } from '../services/socketService';
 import { useRoomStore } from '../store/useRoomStore';
-import { DEFAULT_VIDEO, SOCKET_SERVER_URL } from '../utils/helpers';
+import { DEFAULT_VIDEO, SOCKET_SERVER_URL, EMOJI_REACTIONS } from '../utils/helpers';
 
 // Subcomponents
 import Header from '../components/Header';
@@ -109,7 +109,7 @@ export default function Room() {
 
   // Voice WebRTC Audio Streams & Activity State
   const [isMicMuted, setIsMicMuted] = useState(true);
-  const [remoteAudioStreams, setRemoteAudioStreams] = useState({}); // peerId -> MediaStream
+  const [remoteAudioStreams, setRemoteAudioStreams] = useState({});
   const [speakingPeers, setSpeakingPeers] = useState(new Set());
   const [mutedPeers, setMutedPeers] = useState(new Set());
   const [peerVolumes, setPeerVolumes] = useState({});
@@ -181,7 +181,6 @@ export default function Room() {
       });
     });
 
-    // Answer incoming voice call with our local stream (or fallback silent stream)
     peer.on('call', (call) => {
       const answerCall = (stream) => {
         call.answer(stream);
@@ -197,14 +196,12 @@ export default function Room() {
         navigator.mediaDevices.getUserMedia({ audio: true, video: false })
           .then((stream) => {
             localStreamRef.current = stream;
-            // Start muted by default
             stream.getAudioTracks().forEach((t) => (t.enabled = false));
             setIsMicMuted(true);
             setupAudioAnalyser(stream);
             answerCall(stream);
           })
           .catch(() => {
-            // Fallback audio graph
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
             const osc = ctx.createOscillator();
             const dst = ctx.createMediaStreamDestination();
@@ -225,7 +222,6 @@ export default function Room() {
     };
   }, [roomId, username, hasPromptedToJoin]);
 
-  // Outgoing WebRTC Voice Call
   const callPeer = (targetPeerId) => {
     if (!peerRef.current || !targetPeerId || targetPeerId === peerRef.current.id) return;
     if (activeCallsRef.current.has(targetPeerId)) return;
@@ -300,7 +296,6 @@ export default function Room() {
         localStreamRef.current = stream;
         setupAudioAnalyser(stream);
 
-        // Re-call existing participants with active mic stream
         roomParticipants.forEach((p) => {
           if (p.peerId && p.peerId !== peerRef.current?.id) {
             callPeer(p.peerId);
@@ -358,6 +353,7 @@ export default function Room() {
       setCurrentTime(state.currentTimestamp || 0);
 
       if (state.users) {
+        setParticipants(state.users);
         state.users.forEach((u) => {
           if (u.peerId) callPeer(u.peerId);
         });
@@ -370,14 +366,18 @@ export default function Room() {
     });
 
     socket.on('USER_JOINED', ({ users, peerId: newPeerId }) => {
-      setParticipants(users);
+      if (users) {
+        setParticipants(users);
+      }
       if (newPeerId) {
         callPeer(newPeerId);
       }
     });
 
     socket.on('USER_LEFT', ({ users, peerId: leftPeerId }) => {
-      setParticipants(users);
+      if (users) {
+        setParticipants(users);
+      }
       if (leftPeerId) {
         const call = activeCallsRef.current.get(leftPeerId);
         if (call) {
@@ -835,7 +835,7 @@ export default function Room() {
     if (pendingHostTransferUser) {
       socketRef.current?.emit('TRANSFER_HOST', { targetSocketId: pendingHostTransferUser.socketId });
       setPendingHostTransferUser(null);
-      showInAppToast(`Room host crown transferred`);
+      showInAppToast('Room host crown transferred');
     }
   };
 
@@ -866,7 +866,6 @@ export default function Room() {
     }
   };
 
-  // Copy Room Link Action: Replaces alert() with in-app toast
   const handleCopyLink = () => {
     navigator.clipboard.writeText(window.location.href);
     showInAppToast('Room link copied to clipboard!');
@@ -1024,7 +1023,7 @@ export default function Room() {
         setSettingsView(null);
       }}
     >
-      {/* Hidden Peer Audio Elements: Renders incoming voice streams */}
+      {/* Hidden Peer Audio Elements: Plays incoming WebRTC audio tracks */}
       <div style={{ display: 'none' }}>
         {Object.entries(remoteAudioStreams).map(([peerId, stream]) => (
           <audio
@@ -1081,6 +1080,47 @@ export default function Room() {
 
       {/* Floating Reactions Layer */}
       <FloatingReactions activeReactions={activeReactions} />
+
+      {/* Fixed Reaction Dock: Always accessible to all room users */}
+      <div
+        style={{
+          position: 'fixed',
+          bottom: 24,
+          right: activeSideDrawer ? 360 : 24,
+          background: 'rgba(15, 23, 42, 0.85)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          border: '1px solid rgba(255, 255, 255, 0.12)',
+          borderRadius: 9999,
+          padding: '4px 10px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          zIndex: 45,
+          boxShadow: '0 10px 25px rgba(0, 0, 0, 0.5)',
+          transition: 'right 0.25s ease'
+        }}
+      >
+        {EMOJI_REACTIONS.map((emoji) => (
+          <button
+            key={emoji}
+            onClick={() => handleSendReaction(emoji)}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              fontSize: 20,
+              cursor: 'pointer',
+              padding: '4px 6px',
+              borderRadius: 8,
+              transition: 'transform 0.15s ease'
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.transform = 'scale(1.25)')}
+            onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+          >
+            {emoji}
+          </button>
+        ))}
+      </div>
 
       {/* Top Header */}
       <Header

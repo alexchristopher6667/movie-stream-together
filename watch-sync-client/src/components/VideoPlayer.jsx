@@ -129,6 +129,23 @@ export default function VideoPlayer({
 
   const ytVideoId = isYouTube ? getYouTubeId(videoUrl) : null;
 
+  // Unload and stop background media when switching sources
+  useEffect(() => {
+    if (isYouTube) {
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+        videoRef.current.load();
+      }
+    } else {
+      if (ytPlayerRef.current && isYtReady.current && typeof ytPlayerRef.current.pauseVideo === 'function') {
+        try {
+          ytPlayerRef.current.pauseVideo();
+        } catch {}
+      }
+    }
+  }, [isYouTube, videoUrl]);
+
   // Unified engine controller exposed to Room.jsx
   useEffect(() => {
     if (!engineRef) return;
@@ -177,7 +194,7 @@ export default function VideoPlayer({
     };
   }, [isYouTube, engineRef, videoRef]);
 
-  // YouTube Player Loader & Captions Discovery
+  // YouTube Player Loader
   useEffect(() => {
     if (!isYouTube || !ytVideoId) {
       isYtReady.current = false;
@@ -216,7 +233,6 @@ export default function VideoPlayer({
             const dur = event.target.getDuration();
             if (dur) setDuration(dur);
 
-            // Fetch available closed captions
             try {
               const trackList = event.target.getOption?.('captions', 'tracklist') || [];
               if (trackList.length > 0) setYtCaptions(trackList);
@@ -810,7 +826,6 @@ export default function VideoPlayer({
         >
           {settingsView === 'main' && (
             <>
-              {/* Native Video: Audio Tracks Selector */}
               {!isYouTube && (
                 <button
                   onClick={() => setSettingsView('audio')}
@@ -835,7 +850,6 @@ export default function VideoPlayer({
                 </button>
               )}
 
-              {/* Subtitles / CC Option */}
               <button
                 onClick={() => setSettingsView('subtitles')}
                 style={{
@@ -863,7 +877,6 @@ export default function VideoPlayer({
                 </div>
               </button>
 
-              {/* Playback Speed Option */}
               {hasControlAccess ? (
                 <button
                   onClick={() => setSettingsView('speed')}
@@ -896,7 +909,6 @@ export default function VideoPlayer({
                 </div>
               )}
 
-              {/* Informational YouTube Stream Badge */}
               {isYouTube && (
                 <div style={{ 
                   margin: '4px 2px 2px 2px', 
