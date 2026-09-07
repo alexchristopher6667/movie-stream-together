@@ -10,6 +10,60 @@ export const checkRoomExists = (req, res) => {
   res.json({ exists });
 };
 
+// High-speed direct upload with auto-cleanup (0 CORS restrictions, full byte-range seeking)
+export const handleCloudUploadProxy = (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
+  req.setTimeout(0);
+  res.setTimeout(0);
+
+  const rawFileName = req.headers['x-file-name'] || `video-${Date.now()}.mp4`;
+  const ext = path.extname(decodeURIComponent(rawFileName)) || '.mp4';
+  const cleanBaseName = path.basename(decodeURIComponent(rawFileName), ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const targetFileName = `${Date.now()}-${cleanBaseName}${ext}`;
+  const targetFilePath = path.join(CONFIG.MEDIA_DIR, targetFileName);
+
+  const writeStream = fs.createWriteStream(targetFilePath);
+
+  req.pipe(writeStream);
+
+  writeStream.on('finish', () => {
+    res.json({
+      success: true,
+      url: `/media/${targetFileName}`
+    });
+
+    // Auto-cleanup: File automatically self-destructs after 2 hours (True Disposable Cloud)
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(targetFilePath)) {
+          fs.unlinkSync(targetFilePath);
+          console.log(`[Auto-Cleanup] Disposable video purged: ${targetFileName}`);
+        }
+      } catch {}
+    }, 2 * 60 * 60 * 1000);
+  });
+
+  writeStream.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  req.on('aborted', () => {
+    try {
+      writeStream.destroy();
+      if (fs.existsSync(targetFilePath)) fs.unlinkSync(targetFilePath);
+    } catch {}
+  });
+};
+
 export const handleMediaUpload = (io) => (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video uploaded' });
 
@@ -69,7 +123,6 @@ export const handleMediaUpload = (io) => (req, res) => {
 
         const room = roomStore.get(roomId);
         if (room) {
-          // Track generated files for automatic cleanup
           const generatedFiles = [
             hlsOutputDir,
             ...extractedAudioTracks.map(t => path.join(CONFIG.MEDIA_DIR, path.basename(t.url))),
